@@ -1,5 +1,6 @@
 # Compute N-Body
 Simulating NBody via compute shader
+See "compute" scene.
 
 Quick flow:
 1. pass particles as array.
