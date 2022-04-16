@@ -1,0 +1,222 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+
+#pragma kernel RenderParticles
+#pragma kernel RenderWipe
+#pragma kernel RenderDebug
+#pragma kernel RenderDebugS
+
+#pragma kernel GenerateForcesSelf
+#pragma kernel ApplyForcesSelf
+#pragma kernel SumForcesSelf
+#pragma kernel SumForcesSelf_Init
+
+struct Particle
+{
+    float3 pos;
+    float3 vel;
+    float mass;
+    float3 accel;
+    float3 accelPrev;
+};
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+
+unsigned int SumTargetOffset; // offset in outward texture for summation: 0, 0+1/2, 0+1/2+1/4, 0+1/2+1/4+1/8
+unsigned int SumSourceOffset;
+// 1d array size of particle batch p^2
+RWStructuredBuffer<Particle> ParticleBuffer;
+RWStructuredBuffer<float3> ForcesBuffer; //squashed 2d array
+
+RWTexture2D<float4> RenderTex;
+
+float dt;
+float ViewExtentsToTexSizeK;
+float yRot;
+float RenderRetain;
+float DistanceClip;
+bool MergeMasses;
+unsigned int TextureSide;
+unsigned int ParticleCount;
+
+unsigned int ParticlesInBatch;
+unsigned int BatchOffset1;
+unsigned int BatchOffset2;
+
+
+//-------Rendering particles -------
+[numthreads(8,8,1)]
+void RenderWipe(uint3 id : SV_DispatchThreadID)
+{
+    //partial wipe for trails
+    RenderTex[id.xy] = RenderTex[id.xy] * RenderRetain; //float4(0.0, 0.0, 0.0, 1.0);
+}
+
+[numthreads(8,1,1)]
+void RenderParticles(uint3 id : SV_DispatchThreadID)
+{
+    //float z = (ParticleBuffer[id.x].pos.z + 300.0)/600.0;
+    //float3 ori = ParticleBuffer[42].pos.xyz;
+    float3 ori = float3(0, 0, 0);
+    float3 curPos = ParticleBuffer[id.x].pos.xyz - ori;
+    float x = curPos.x * cos(yRot) - curPos.z * sin(yRot);
+
+    int2 particlePos = float2(x, curPos.y) * ViewExtentsToTexSizeK + TextureSide * 0.5;
+
+    float4 col = float4(ParticleBuffer[id.x].mass / 100.0, ParticleBuffer[id.x].mass / 1000.0,
+                                       ParticleBuffer[id.x].mass / 11000.0, 0.0);
+    
+    RenderTex[particlePos.xy+float2(0,1)] = col;
+    RenderTex[particlePos.xy+float2(0,-1)] = col;
+    RenderTex[particlePos.xy+float2(-1,0)] = col;
+    RenderTex[particlePos.xy+float2(1,0)] = col;
+    RenderTex[particlePos.xy] = col;
+
+                                       
+    //RenderTex[particlePos.xy] = float4(ParticleBuffer[id.x].mass / 100.0, ParticleBuffer[id.x].mass / 1000.0,
+//                                       ParticleBuffer[id.x].mass / 11000.0, 0.0);
+
+    //RenderTex[particlePos.xy] = float4(abs(ParticleBuffer[id.x].vel)*1000, 0.0);
+}
+
+[numthreads(8,8,1)]
+void RenderDebug(uint3 id : SV_DispatchThreadID)
+{
+    int targetId = id.x * ParticleCount + id.y;
+
+    RenderTex[id.xy] += float4(ForcesBuffer[targetId] * 100, 0.0);
+}
+
+[numthreads(8,8,1)]
+void RenderDebugS(uint3 id : SV_DispatchThreadID)
+{
+    int targetId = id.x * ParticleCount + id.y;
+
+    RenderTex[id.xy] += float4(ForcesBuffer[targetId] * 100, 0.0);
+}
+
+//-------PHYSICS CALCULATION-------
+
+// ParticlesInBatch, BatchOffset1, BatchOffset2, ForcesArray, particleBuffer
+[numthreads(8,8,1)]
+void GenerateForcesSelf(uint3 id : SV_DispatchThreadID)
+{
+    //id.x and id.y are particle ids. X affects Y
+    //pid = id;
+    int forceIndex = id.x * ParticlesInBatch + id.y;
+    int forceIndexR = id.y * ParticlesInBatch + id.x;
+    
+    int pStatic = id.x + ParticlesInBatch * BatchOffset1;
+    int pAffected = id.y + ParticlesInBatch * BatchOffset2;
+
+    if (id.x > id.y) return;
+    
+    if (pStatic == pAffected)
+    {
+        //since sum will be from zero, use this as init for existing force.
+        ForcesBuffer[forceIndex] = float3(0, 0, 0); //ParticleBuffer[p1id].vel;
+    }
+    else
+    {
+        float dist = distance(ParticleBuffer[pStatic].pos, ParticleBuffer[pAffected].pos);
+
+        // mass condensation
+        if (dist < DistanceClip)
+        {
+            dist = DistanceClip;
+            if (MergeMasses)
+            {
+                ParticleBuffer[pAffected].mass += ParticleBuffer[pStatic].mass;
+
+                ParticleBuffer[pStatic].mass = 0.00001;
+                ParticleBuffer[pStatic].vel = float3(0, 0, 0);
+                ParticleBuffer[pStatic].accel = ParticleBuffer[pAffected].vel;
+            }
+        }
+
+
+        float3 dir = normalize(ParticleBuffer[pStatic].pos - ParticleBuffer[pAffected].pos);
+        float power = ParticleBuffer[pStatic].mass * ParticleBuffer[pAffected].mass;
+        float force = (power / pow(dist, 2));
+
+        float3 forceVec = dir * force;
+        ForcesBuffer[forceIndex] = forceVec;
+        ForcesBuffer[forceIndexR] = -forceVec;
+    }
+}
+
+//will compute sums in vertical slices;
+//limit number of gropus by count of slices: .dispatch(pcount/64 * column count);
+[numthreads(1,256,1)]
+void SumForcesSelf(uint3 id : SV_DispatchThreadID)
+{
+    int2 target2d = int2(id.x + SumTargetOffset, id.y);
+    int2 source2d_1 = int2(id.x * 2 + SumSourceOffset, id.y);
+    int2 source2d_2 = int2(id.x * 2 + SumSourceOffset + 1, id.y);
+
+    int targetId = target2d.x * ParticleCount + target2d.y;
+    int src_1 = source2d_1.x * ParticleCount + source2d_1.y;
+    int src_2 = source2d_2.x * ParticleCount + source2d_2.y;
+
+    ForcesBuffer[targetId] = ForcesBuffer[src_1] + ForcesBuffer[src_2];
+}
+
+//generate first chunk of summation array
+//will generate based on target count which should be batchcount/2
+[numthreads(16,16,1)]
+void SumForcesSelf_Init(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= ParticleCount * 0.5)
+    {
+        return;
+    }
+    
+    int2 target2d = int2(id.x, id.y);
+    int2 source2d_2 = int2(id.x + ParticleCount * 0.5, id.y);
+
+    int targetId = target2d.x * ParticleCount + target2d.y;
+    int src_2 = source2d_2.x * ParticleCount + source2d_2.y;
+
+    ForcesBuffer[targetId] = ForcesBuffer[targetId] + ForcesBuffer[src_2];
+}
+
+//or dont give a fuck and permute on cpu
+//applies forces from summation buffer to particle positions;
+[numthreads(1,256,1)]
+void ApplyForcesSelf(uint3 id : SV_DispatchThreadID)
+{
+    /*   int batchId = id.y;
+    int pnum = batchId + ParticlesInBatch * BatchOffset2;
+       
+    int2 target2d = int2(SumTargetOffset, batchId);
+    int targetId = target2d.x * ParticleCount + target2d.y;
+    */
+
+    //Get result position in summation buffet
+    //id.x is always 0 due to theeads. and we add summed offset to it.
+    //id.y is particle id by vertical.
+    int2 SumBufferPos2d = int2(id.x + SumTargetOffset, id.y);
+    int SumBufferIndex = SumBufferPos2d.x * ParticleCount + SumBufferPos2d.y;
+
+    int pnum = id.y;
+
+
+    /* old style stupid application
+     ParticleBuffer[pnum].vel += SummationBuffer[SumBufferIndex];
+     ParticleBuffer[pnum].pos += ParticleBuffer[pnum].vel;
+     
+ */
+
+    //F=ma; a=F/m
+    //leapfrog integration
+    ParticleBuffer[pnum].accel = (ForcesBuffer[SumBufferIndex]) / ParticleBuffer[pnum].mass;
+
+    ParticleBuffer[pnum].pos += (ParticleBuffer[pnum].vel * dt) + (0.5f * ParticleBuffer[pnum].accelPrev * dt * dt);
+    ParticleBuffer[pnum].vel += (0.5f * (ParticleBuffer[pnum].accelPrev + ParticleBuffer[pnum].accel) * dt);
+
+    ParticleBuffer[pnum].accelPrev = ParticleBuffer[pnum].accel;
+    /*
+        ParticleBuffer[pnum].pos.x = ParticleBuffer[pnum].pos.x % TextureSide;
+        ParticleBuffer[pnum].pos.y = ParticleBuffer[pnum].pos.y % TextureSide;
+        ParticleBuffer[pnum].pos.z = ParticleBuffer[pnum].pos.z % TextureSide;*/
+}

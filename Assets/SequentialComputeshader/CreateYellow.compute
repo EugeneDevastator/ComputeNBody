@@ -1,0 +1,110 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel AddRed
+#pragma kernel AddGreen
+
+#pragma kernel SumAlongX
+#pragma kernel ShowTexture
+#pragma kernel RenderParticles
+#pragma kernel MoveParticles
+#pragma kernel RenderWipe
+
+
+struct Particle
+{
+    float3 pos;
+    float3 vec;
+};
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+
+unsigned int SumTargetOffset; // offset in outward texture for summation: 0, 0+1/2, 0+1/2+1/4, 0+1/2+1/4+1/8
+unsigned int SumSourceOffset;
+// 1d array size of particle batch p^2
+RWStructuredBuffer<float3> ForcesBuffer; //squashed 2d array
+RWStructuredBuffer<float3> SummationBuffer; //squashed 2d array
+RWStructuredBuffer<Particle> ParticleBuffer;
+
+RWStructuredBuffer<float> dataBuffer;
+
+RWTexture2D<float4> Result;
+RWTexture2D<float4> SumResult;
+
+
+unsigned int TextureSide;
+unsigned int ParticleCount;
+
+unsigned int ParticlesInBatch;
+unsigned int BatchOffset1;
+unsigned int BatchOffset2;
+unsigned int EachN;
+
+
+
+
+[numthreads(8,8,1)]
+void AddRed(uint3 id : SV_DispatchThreadID)
+{
+    Result[id.xy] = Result[id.xy] + float4(0.02, 0.0, 0.0, 0.0);
+}
+
+[numthreads(8,8,1)]
+void AddGreen(uint3 id : SV_DispatchThreadID)
+{
+    Result[id.xy] = Result[id.xy] + float4(0.0, 0.02, 0.0, 0.0);
+}
+
+[numthreads(8,8,1)]
+void ShowTexture(uint3 id : SV_DispatchThreadID)
+{
+    int buffId = (id.x * TextureSide + id.y);
+    dataBuffer[buffId] += 900;
+    Result[id.xy] = dataBuffer[buffId] / 3000.0;
+}
+
+//-------Rendering particles -------
+[numthreads(8,8,1)]
+void RenderWipe(uint3 id : SV_DispatchThreadID)
+{
+    Result[id.xy] = float4(0.0, 0.0, 0.0, 1.0);
+}
+
+[numthreads(8,1,1)]
+void RenderParticles(uint3 id : SV_DispatchThreadID)
+{
+    int2 particlePos = ParticleBuffer[id.x].pos;
+    Result[particlePos.xy] += float4(0.1, 0.1, 0.1, 0.0);
+}
+
+//-------PHYSICS CALCULATION-------
+
+[numthreads(8,1,1)]
+void MoveParticles(uint3 id : SV_DispatchThreadID)
+{
+    ParticleBuffer[id.x].pos = ParticleBuffer[id.x].pos + ParticleBuffer[id.x].vec;
+}
+
+//==========other sum methods===============
+
+[numthreads(8,8,1)]
+void SumAlongX(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x % EachN == EachN - 1)
+    {
+        Result[id.xy] += Result[int2(id.x - EachN + 1, id.y)];
+    }
+}
+
+[numthreads(1,64,1)]
+void SumAlongXFirst(uint3 id : SV_DispatchThreadID)
+{
+    SumResult[id.xy] = Result[int2(id.x * 2, id.y)] + Result[int2(id.x * 2 + 1, id.y)];
+}
+/*
+void SumAlongXSeries(uint3 id : SV_DispatchThreadID)
+{
+  //  int CurLocalPos = id.x - CurrOffset;
+    //int TargetBasePos = (CurLocalPos * 2);
+    //SumResult[id.xy] = SumResult[OffsetLast+(TargetBasePos,id.y)] + SumResult[OffsetLast+(TargetBasePos+1,id.y)];
+}
+*/
